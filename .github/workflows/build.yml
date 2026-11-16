@@ -1,0 +1,195 @@
+name: Build SQLite (32k columns) + CPython
+
+on:
+  push:
+    branches: [main, master]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      sqlite_version:
+        description: 'SQLite amalgamation version (e.g. 3.54.1 -> 3540100)'
+        default: '3540100'
+      sqlite_year:
+        description: 'SQLite release year (for download URL)'
+        default: '2026'
+      python_version:
+        description: 'CPython version (e.g. 3.15.2)'
+        default: '3.15.2'
+      max_column:
+        description: 'SQLITE_MAX_COLUMN value'
+        default: '32767'
+
+env:
+  SQLITE_VERSION: ${{ github.event.inputs.sqlite_version || '3540100' }}
+  SQLITE_YEAR:    ${{ github.event.inputs.sqlite_year || '2026' }}
+  PYTHON_VERSION: ${{ github.event.inputs.python_version || '3.15.2' }}
+  MAX_COLUMN:     ${{ github.event.inputs.max_column || '32767' }}
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # SQLite: shared lib + CLI with SQLITE_MAX_COLUMN bumped to 32767
+  # ---------------------------------------------------------------------------
+  sqlite-unix:
+    name: sqlite / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build SQLite
+        shell: bash
+        run: ./scripts/build_sqlite_unix.sh "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-${{ matrix.target }}
+          path: dist/sqlite-${{ matrix.target }}/
+          if-no-files-found: error
+
+  sqlite-windows:
+    name: sqlite / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+            msvc_arch: x64
+          - target: windows-arm64
+            runner: windows-11-arm
+            msvc_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Enter MSVC dev environment
+        shell: pwsh
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+          if (-not $vs) { throw "Visual Studio with VC tools not found" }
+          $vcvars = "$vs\VC\Auxiliary\Build\vcvarsall.bat"
+          # Dump env after running vcvarsall, then export every var to $GITHUB_ENV
+          cmd /c "`"$vcvars`" ${{ matrix.msvc_arch }} && set" |
+            ForEach-Object {
+              if ($_ -match '^([^=]+)=(.*)$') {
+                "$($Matches[1])=$($Matches[2])" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+              }
+            }
+      - name: Build SQLite
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./scripts/build_sqlite_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: sqlite-${{ matrix.target }}
+          path: dist/sqlite-${{ matrix.target }}/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # CPython: rebuilt from source against the patched SQLite amalgamation
+  # ---------------------------------------------------------------------------
+  python-unix:
+    name: python / ${{ matrix.target }}
+    needs: sqlite-unix
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: linux-x64
+            runner: ubuntu-latest
+          - target: linux-arm64
+            runner: ubuntu-24.04-arm
+          - target: macos-arm64
+            runner: macos-15
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: sqlite-${{ matrix.target }}
+          path: dist/sqlite-${{ matrix.target }}
+      - name: Build CPython
+        shell: bash
+        run: ./scripts/build_python_unix.sh "${{ matrix.target }}"
+      - name: Smoke test — 32k columns
+        shell: bash
+        run: ./scripts/test_32k_unix.sh "${{ matrix.target }}"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/python-${{ matrix.target }}/
+          if-no-files-found: error
+
+  python-windows:
+    name: python / ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: windows-x64
+            runner: windows-latest
+            pcbuild_arch: x64
+          - target: windows-arm64
+            runner: windows-11-arm
+            pcbuild_arch: arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build CPython (with patched SQLite)
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+          PCBUILD_ARCH: ${{ matrix.pcbuild_arch }}
+        run: ./scripts/build_python_windows.ps1
+      - name: Smoke test — 32k columns
+        shell: pwsh
+        env:
+          TARGET: ${{ matrix.target }}
+        run: ./scripts/test_32k_windows.ps1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: python-${{ matrix.target }}
+          path: dist/python-${{ matrix.target }}/
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Publish artifacts after successful main builds or version-tag builds
+  # ---------------------------------------------------------------------------
+  release:
+    if: github.ref == 'refs/heads/main' || startsWith(github.ref, 'refs/tags/v')
+    needs: [sqlite-unix, sqlite-windows, python-unix, python-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Package
+        run: |
+          mkdir -p release
+          cd artifacts
+          for d in */; do
+            name="${d%/}"
+            tar -czf "../release/${name}.tar.gz" -C "$name" .
+          done
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref == 'refs/heads/main' && format('ci-{0}-{1}', github.run_number, github.run_attempt) || github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          gh release create "$TAG" release/*.tar.gz \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$COMMIT" \
+            --title "$TAG" \
+            --generate-notes
